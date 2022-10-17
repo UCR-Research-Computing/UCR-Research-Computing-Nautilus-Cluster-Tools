@@ -1,0 +1,349 @@
+#!/usr/bin/python3
+
+####### Load modules ##########
+import subprocess
+from subprocess import Popen, PIPE
+import time
+import os
+import sys
+import argparse
+import random
+import configparser
+import getpass
+from re import search
+
+
+###### Setting argument variables with ArgParse
+parser = argparse.ArgumentParser()
+requiredNamed = parser.add_argument_group('required named arguments')
+requiredNamed.add_argument("-p", "--cpus" , help='How many CPUs requested.', required=False, type=int)
+requiredNamed.add_argument("-m", "--memory" , help='Number of GB of memory requested.', required=False, type=int)
+requiredNamed.add_argument("-g", "--gpus" , help='Number of GPUs requested.', required=False)
+
+requiredNamed.add_argument("-r", "--running" , help='List running workstations.', required=False, nargs='?', const=1, type=int)
+requiredNamed.add_argument("-c", "--container" , help='Name of container from DockerHub or PRP GitLab.', required=False)
+requiredNamed.add_argument("-a", "--avail" , help='List of common containers available to use. Any DockerHub or PRP Container can also be used.', required=False, nargs='?', const=1, type=int)
+requiredNamed.add_argument("-d", "--command" , help='Command to run on the workstation if not a shell.', required=False)
+requiredNamed.add_argument("--delete" , help='Delete a workstation.', required=False)
+requiredNamed.add_argument("--delete_all" , help='Delete all active workstations.', required=False, nargs='?', const=1, type=int)
+requiredNamed.add_argument("--connect" , help='Connect to a workstation.', required=False)
+requiredNamed.add_argument("--copy" , help='Shows syntax for copying to a workstation.', required=False, nargs='?', const=1, type=int)
+requiredNamed.add_argument("-s", "--status" , help='Shows status for all workstations and their pods.', required=False, nargs='?', const=1, type=int)
+args = parser.parse_args()
+
+
+###### Variables ###############
+currentuser = getpass.getuser()
+
+container = args.container
+if container == None:
+    container = "gitlab-registry.nrp-nautilus.io/ucr-research-computing/ucr-rc-nautilus-research-nodes:latest"
+
+cpus = args.cpus
+if cpus == None:
+    cpus = 4
+if cpus > 32:
+    print("CPUs need to be 32 or less")
+    exit()
+
+memory = args.memory
+if memory == None:
+    memory = 8
+if memory > 64:
+    print("Memory need to be 64GB or less")
+    exit()
+
+gpus = args.gpus
+if gpus == None:
+    gpus = 0
+
+jobname = "%s-research-lab-%d" % (currentuser,  random.randint(1000,9999))
+
+running = args.running
+if running == None:
+    running = 0
+
+command = args.command
+if command == None:
+    command = "sleep infinity"
+
+
+
+###### Functions ################
+
+def submit_job(jobname, container, command):
+    cmd = """cat <<EOF | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+spec:
+  template:
+    spec:
+      containers:
+      - name: %s
+        image: %s
+        command:
+        - sh
+        - -c
+        - "%s"
+
+        volumeMounts:
+        - mountPath: /sharedvol
+          name: sharedvol
+        - name: git-repo
+          mountPath: /opt/repo
+        resources:
+          limits:
+            memory: %dGi
+            cpu: "%d"
+          requests:
+            memory: 2Gi
+            cpu: "1"
+      initContainers:
+      - name: init-clone-repo
+        image: alpine/git
+        args:
+          - clone
+          - --single-branch
+          - https://gitlab.nrp-nautilus.io/forsythc/example-blast-jobs.git
+          - /opt/repo/blast
+        volumeMounts:
+          - name: git-repo
+            mountPath: /opt/repo
+      volumes:
+      - name: sharedvol
+        persistentVolumeClaim:
+          claimName: master-vol
+      - name: git-repo
+        emptyDir: {}
+      restartPolicy: Never
+  backoffLimit: 1
+EOF
+        """ % (jobname, jobname, container, command, memory, cpus)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+    return
+    
+def get_podname(jobname):
+    cmd = "kubectl get pods --no-headers --selector=job-name=%s | awk '{print $1}'" % (jobname)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+    result = result.rstrip()
+    decoded_result = result.decode()
+    return decoded_result
+
+def monitor_job(jobname):
+    print("Launching %s workstation node ... " %(jobname))
+    while True:
+        if args.command == None:
+            cmd = "kubectl get pods --no-headers --selector=job-name=%s | grep 'Running' | awk '{print $1}'" % (jobname)
+        else:
+            cmd = "kubectl get pods --no-headers --selector=job-name=%s | grep 'Completed' | awk '{print $1}'" % (jobname)
+        cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result, err = cmdresult.communicate()
+        result = result.rstrip()
+        time.sleep(5)
+        status = get_pod_status(jobname)
+        print("Status ...  %s" % status)
+        myerror = "Err"
+        if search(myerror, status):
+            print(get_pod_describe(get_podname(jobname)))
+            print("Error! Deleting the appempt ....")
+            clean_up_job(jobname)
+            print("Deleted")
+            exit()
+        if not result:
+            pass
+        else:
+            decoded_result = result.decode()
+            return decoded_result
+
+def get_pod_logs(podname):
+    cmd = "kubectl logs %s" % (podname)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+    decoded_result = result.decode()
+    return decoded_result
+
+def ask_to_save(jobname):
+    running = input("Enter 'y' to keep the %s workstation node running for later?" % (jobname)).lower() 
+    if running == 'y':
+        print("")
+        print("Saved - run: 'nautilus -r' to see running workstations.")
+        save = 1
+    else:
+        save = 0
+        clean_up_job(jobname)
+    return save
+
+def delete_all_jods(returnedrunningnodes):
+    print_running_pods(returnedrunningnodes)
+    running = input("Enter 'y' to REALLY delete all active workstations - ") 
+    running = running.lower()
+    if running == 'y':
+        for x in returnedrunningnodes:
+            print("Deleting workstation %s ..." % x)
+            clean_up_job(x)
+        save = 1
+    else:
+        save = 0
+        print("Backing out")
+        quit()
+    return save
+
+def get_pod_describe(podname):
+    cmd = "kubectl describe pods %s" % (podname)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+    decoded_result = result.decode()
+    return decoded_result
+
+
+def clean_up_job(jobname):
+    cmd = "kubectl delete jobs %s" % (jobname)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+
+def pod_connect(podname):
+    podname = str(podname)
+    cmd = "kubectl exec -it %s -- bash" % (podname)
+    os.system(cmd)
+
+def get_active_pods(currentuser):
+    cmd = "kubectl get jobs | grep %s | awk '{print $1}'" % (currentuser)
+    out_lines = subprocess.check_output(["/bin/sh", "-c", cmd]).splitlines()
+    cleanoutputlist = []
+    for x in out_lines:
+        dx = x.decode()
+        cleanoutputlist.append(dx)
+    return cleanoutputlist
+
+
+def print_available_containers():
+    print("""
+######### Short List of Containers Avaiable #########
+## Can used with "nautilus -c <container>" command ##
+
+ubuntu:latest
+ubuntu:bionic
+ubuntu:focal
+centos:latest
+centos7
+centos6
+rockylinux/rockylinux:latest
+debian:latest
+gitlab-registry.nrp-nautilus.io/ucr-research-computing/ucr-rc-nautilus-research-nodes:latest
+gitlab-registry.nrp-nautilus.io/ucr-research-computing/ucr-rc-nautilus-genomics-conda-node:latest
+gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp:latest
+nginx:latest
+gitlab-registry.nrp-nautilus.io/forsythc/container-blast
+
+Any other container from public registries!
+
+#####################################################
+        """)
+
+def print_running_pods(returnedrunningnodes):
+    for x in returnedrunningnodes:
+        print(x)
+
+def print_copy_command(returnedrunningnodes):
+    print("""
+######### Command to copy files to your workstations ########
+## 
+##
+## kubectl cp <local-filename> <workstation-podname>:<remote-path-and-filename>
+## kubectl cp <workstation-podname>:<remote-path-and-filename> <local-filename>
+##
+## Podnames needed for your Workstations:
+        """)
+    for x in returnedrunningnodes:
+        print("Workstation: %s = %s " % (x, get_podname(x)))
+    print("""
+##
+#############################################################
+        """)
+
+def get_pod_status(jobname):
+    podname = get_podname(jobname)
+    cmd = "kubectl get pods --no-headers --selector=job-name=%s | awk '{print $3}'" % (jobname)
+    cmdresult = subprocess.Popen(["/bin/sh", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result, err = cmdresult.communicate()
+    result = result.rstrip()
+    decoded_result = result.decode()
+    #print(decoded_result)
+    return decoded_result
+
+def print_job_pod_status(returnedrunningnodes):
+    print("""
+######### Status of all your workstations  and their pods ########
+##
+##   Workstation   ->   podname   ->   status
+        """)
+    for x in returnedrunningnodes:
+        print("%s -> %s -> %s" % (x, get_podname(x), get_pod_status(x)))
+    print("")
+    print("")
+    print("")
+
+
+
+########## Main Code ##########
+
+if __name__ == '__main__':
+
+    if args.running != None:
+        returnedrunningnodes = get_active_pods(currentuser)
+        print_running_pods(returnedrunningnodes)
+        exit()
+
+    if args.status != None:
+        returnedrunningnodes = get_active_pods(currentuser)
+        print_job_pod_status(returnedrunningnodes)
+        exit()
+
+    if args.copy != None:
+        returnedrunningnodes = get_active_pods(currentuser)
+        print_copy_command(returnedrunningnodes)
+        exit()
+
+    if args.delete != None:
+        clean_up_job(args.delete)
+        exit()
+
+    if args.connect != None:
+        pod_connect(get_podname(args.connect))
+        exit()
+
+    if args.avail != None:
+        print_available_containers() 
+        exit()
+
+    if args.delete_all != None:
+        delete_all_jods(get_active_pods(currentuser)) 
+        exit()
+
+    submit_job(jobname, container, command)
+
+    podname = get_podname(jobname)
+
+    monitor_job(jobname)
+
+    if args.command == None:
+        pod_connect(podname)
+        ask_to_save(jobname)
+        exit()
+    
+    print(get_pod_logs(podname))
+    clean_up_job(jobname) 
+    exit()
+
+
+
+
+
+
+
+
+
